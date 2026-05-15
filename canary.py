@@ -3,8 +3,11 @@ import time
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2.5-1.5B-Instruct")
+# model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2.5-1.5B-Instruct")
 tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-1.5B-Instruct")
+print(tokenizer.special_tokens_map)
+
+"""
 device = "cuda" if torch.cuda.is_available() else "cpu"
 model = model.to(device)
 print(f"Using device: {device}")
@@ -23,3 +26,4 @@ print(f"Generation took {elapsed_seconds:.2f}s")
 
 
 print(tokenizer.decode(outputs[0], skip_special_tokens=True))
+"""
