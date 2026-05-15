@@ -63,8 +63,8 @@ Goal: implement SFT, DPO, and GRPO from scratch on Qwen2.5-1.5B-Instruct. Public
 
 ## **Week 1 (Apr 23–29): Harness \+ SFT Warmup**
 
-- [ ] Repo scaffold (`core/`, `sft.py`, `dpo.py`, `grpo.py`, `README.md`)  
-- [ ] Tokenization utilities  
+- [x] Repo scaffold (`core/`, `sft.py`, `dpo.py`, `grpo.py`, `README.md`)  
+- [x] Tokenization utilities  
 - [ ] Generic training loop with grad accumulation  
 - [ ] Checkpointing  
 - [ ] wandb logging hooks  
