@@ -12,8 +12,19 @@ optimizer.step().
 """
 
 
+
+
 from dataclasses import dataclass
 from pathlib import Path
+from pprint import pformat
+
+import logging
+logging.basicConfig(
+    level=logging.INFO,  # change to DEBUG when you want step-level detail
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+logger = logging.getLogger(__name__)
+
 
 import torch
 
@@ -112,10 +123,12 @@ def init_wandb_run(project, run_name, config):
         - This function should be called once at the start of a script.
         - Do not call wandb.init inside every epoch or every batch.
     """
-    pass
+    import wandb
+    return wandb.init(project=project, name=run_name, config=config)
+    
 
 
-def log_train_metrics(metrics, global_step, use_wandb=False):
+def log_train_metrics(metrics, global_step, use_wandb=False, logger=logger):
     """
     Input:
         metrics:
@@ -145,8 +158,10 @@ def log_train_metrics(metrics, global_step, use_wandb=False):
         - Keep metrics scalar. wandb can log richer objects, but save that
           for later.
     """
-    pass
-
+    logger.info(f'Global step: {global_step}\nMetrics:\n{pformat(metrics)}')
+    if use_wandb:
+        import wandb
+        wandb.log(metrics, step=global_step)
 
 def save_checkpoint(model, optimizer, checkpoint_dir, epoch, global_step):
     """
@@ -189,44 +204,63 @@ def save_checkpoint(model, optimizer, checkpoint_dir, epoch, global_step):
         - torch.save is fine for optimizer state.
         - If you later add a scheduler, save scheduler.state_dict() too.
     """
-    pass
+    checkpoint_dir = Path(checkpoint_dir)
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    model.save_pretrained(checkpoint_dir)
+    torch.save({
+        'optimizer': optimizer.state_dict(),
+        'epoch': epoch,
+        'global_step': global_step
+    }, checkpoint_dir / 'training_state.pt')
 
 
-def load_checkpoint(model, optimizer, checkpoint_dir, device):
+
+def load_checkpoint(checkpoint_dir, optimizer_cls, optimizer_kwargs, device):
     """
     Input:
-        model:
-            Model object to load into.
-
-        optimizer:
-            Optimizer object to restore.
-
         checkpoint_dir:
-            Directory created by save_checkpoint.
+            Directory created by save_checkpoint. It should contain the
+            HuggingFace model files from model.save_pretrained(...) and a
+            training_state.pt file.
+
+        optimizer_cls:
+            Optimizer class to recreate, for example torch.optim.AdamW.
+
+        optimizer_kwargs:
+            Keyword arguments used to construct the optimizer, such as lr,
+            betas, and weight_decay.
 
         device:
-            Device used for torch.load map_location.
+            Device used for model.to(...) and torch.load map_location.
 
     Output:
         A tuple:
             model, optimizer, epoch, global_step
 
     What to do:
-        1. Load model weights. There are two common choices:
-            a. Recreate the model with AutoModelForCausalLM.from_pretrained.
-            b. Or, if you already have the same architecture object, load a
-               state_dict.
-        2. Load training_state.pt with torch.load(..., map_location=device).
-        3. Call optimizer.load_state_dict(...).
-        4. Return restored epoch/global_step so training can resume.
+        1. Recreate the HuggingFace model with
+           AutoModelForCausalLM.from_pretrained(checkpoint_dir).
+        2. Move the model to device.
+        3. Recreate the optimizer on the new model parameters.
+        4. Load training_state.pt with torch.load(..., map_location=device).
+        5. Restore the optimizer state with optimizer.load_state_dict(...).
+        6. Return the restored model, optimizer, epoch, and global_step.
 
     Things to watch:
-        - HuggingFace's from_pretrained is usually the simplest model-loading
-          path. This helper may become easier once you decide exactly how your
-          training script constructs models.
+        - Recreating the optimizer after loading the model is important because
+          optimizers hold references to model parameters.
         - Optimizer state can be large.
     """
-    pass
+    from transformers import AutoModelForCausalLM
+
+    model = AutoModelForCausalLM.from_pretrained(checkpoint_dir)
+    model = model.to(device)
+    optimizer = optimizer_cls(model.parameters(), **optimizer_kwargs)
+
+    training_state = torch.load(Path(checkpoint_dir) / 'training_state.pt', map_location=device)
+    optimizer.load_state_dict(training_state['optimizer'])
+    return model, optimizer, training_state['epoch'], training_state['global_step']
+    
 
 
 def maybe_save_checkpoint(model, optimizer, config, epoch, global_step):
@@ -255,7 +289,10 @@ def maybe_save_checkpoint(model, optimizer, config, epoch, global_step):
                    Path(config.output_dir) / f"step-{global_step:06d}"
             b. Call save_checkpoint(...).
     """
-    pass
+    if not (config.checkpoint_every_steps is None) and global_step != 0 and global_step % config.checkpoint_every_steps == 0:
+        checkpoint_dir = Path(config.output_dir) / f'step-{global_step:06d}'
+        save_checkpoint(model, optimizer, checkpoint_dir, epoch, global_step)
+        
 
 
 def train_one_epoch(
@@ -263,11 +300,9 @@ def train_one_epoch(
     dataloader,
     optimizer,
     device,
-    grad_accum_steps=1,
+    config,
     epoch=0,
     start_global_step=0,
-    log_every_steps=10,
-    use_wandb=False,
 ):
     """
     Input:
@@ -286,23 +321,15 @@ def train_one_epoch(
         device:
             Usually "cuda" or "cpu".
 
-        grad_accum_steps:
-            Number of mini-batches to accumulate before optimizer.step().
-            Example:
-                grad_accum_steps=4 means four backward passes, then one
-                optimizer update.
+        config:
+            TrainConfig containing gradient accumulation, logging, wandb, and
+            checkpoint settings for this epoch.
 
         epoch:
-            Current epoch index, used only for logging.
+            Current epoch index, used for logging and checkpoint metadata.
 
         start_global_step:
             Number of optimizer updates already completed before this epoch.
-
-        log_every_steps:
-            Log every N optimizer updates.
-
-        use_wandb:
-            Whether to call wandb.log through log_train_metrics.
 
     Output:
         A tuple:
@@ -320,12 +347,13 @@ def train_one_epoch(
             b. Call outputs = model(**batch).
             c. Read the scalar loss from outputs.loss.
             d. Save loss.item() for logging before scaling it.
-            e. Divide loss by grad_accum_steps.
+            e. Divide loss by config.grad_accum_steps.
             f. Call backward() on the scaled loss.
-            g. Every grad_accum_steps micro-batches:
+            g. Every config.grad_accum_steps micro-batches:
                 - call optimizer.step()
                 - increment global_step
                 - optionally log metrics
+                - optionally save a checkpoint
                 - call optimizer.zero_grad()
         4. If the epoch ends with leftover accumulated gradients, do one final
            optimizer.step().
@@ -350,13 +378,13 @@ def train_one_epoch(
         loss_value = loss.item()
         losses.append(loss_value)
         accum_steps += 1
-        (loss / grad_accum_steps).backward()
+        (loss / config.grad_accum_steps).backward()
 
-        if accum_steps == grad_accum_steps:
+        if accum_steps == config.grad_accum_steps:
             optimizer.step()
             global_step += 1
 
-            if global_step % log_every_steps == 0:
+            if config.log_every_steps is not None and global_step % config.log_every_steps == 0:
                 log_train_metrics(
                     {
                         "train/loss": loss_value,
@@ -364,15 +392,17 @@ def train_one_epoch(
                         "train/epoch": epoch,
                     },
                     global_step=global_step,
-                    use_wandb=use_wandb,
+                    use_wandb=config.use_wandb,
                 )
 
+            maybe_save_checkpoint(model, optimizer, config, epoch, global_step)
             accum_steps = 0
             optimizer.zero_grad()
 
     if accum_steps > 0:
         optimizer.step()
         global_step += 1
+        maybe_save_checkpoint(model, optimizer, config, epoch, global_step)
         optimizer.zero_grad()
 
     if len(losses) == 0:
@@ -405,11 +435,9 @@ def train(model, dataloader, optimizer, device, config):
     What to do:
         1. Initialize global_step = 0.
         2. Loop over range(config.num_epochs).
-        3. Call train_one_epoch with config.grad_accum_steps, logging settings,
-           and current global_step.
+        3. Call train_one_epoch with config and current global_step.
         4. Log epoch-level average loss.
-        5. Save checkpoint at the end of each epoch, or call
-           maybe_save_checkpoint if you want step-based checkpointing.
+        5. Let train_one_epoch handle step-based checkpointing.
         6. Return global_step.
 
     Things to watch:
@@ -417,7 +445,33 @@ def train(model, dataloader, optimizer, device, config):
         - For the first overfit test, checkpointing can be disabled.
         - Once this works, you can add scheduler support in the same pattern.
     """
-    pass
+    if config.use_wandb:
+        from dataclasses import asdict, is_dataclass
+
+        if is_dataclass(config):
+            config = asdict(config)
+        init_wandb_run("rl-from-scratch", "tiny-sft-train", config)
+
+    global_step = 0
+    for epoch in range(config.num_epochs):
+        loss, global_step = train_one_epoch(
+            model,
+            dataloader,
+            optimizer,
+            device,
+            config,
+            epoch=epoch,
+            start_global_step=global_step,
+        )
+        log_train_metrics(
+            {
+                'epoch': epoch,
+                'avg. epoch loss': loss,
+            },
+            global_step=global_step,
+            use_wandb=config.use_wandb
+        )
+    return global_step
 
 
 def run_tiny_train_smoke_test():
@@ -470,8 +524,47 @@ def run_tiny_train_smoke_test():
     dataloader = DataLoader(tokenized_dataset, batch_size=2, shuffle=True, collate_fn=collator)
     model = model.to('cuda')
     optimizer = torch.optim.AdamW(model.parameters(), lr=2e-5, betas=(0.9, 0.95), weight_decay=0.01)
-    loss, global_step = train_one_epoch(model, dataloader, optimizer, 'cuda', 1)
+    config = TrainConfig(grad_accum_steps=1)
+    loss, global_step = train_one_epoch(model, dataloader, optimizer, 'cuda', config)
     print(f'Loss: {loss}, global_step: {global_step}')
     #print(f'Final tokens:\n{final_tokens}')
+
 if __name__  == '__main__':
-    run_tiny_train_smoke_test()
+    from core.tokenization import ensure_pad_token, tokenize_sft_dataset, SFTDataCollator
+
+    from datasets import Dataset
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from torch.utils.data import DataLoader
+
+    model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2.5-1.5B-Instruct")
+    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-1.5B-Instruct")
+    ensure_pad_token(tokenizer)
+    rows = [
+        {
+            "question": "What is 2 + 2?",
+            "answer": "2 + 2 = 4\n#### 4",
+        },
+        {
+            "question": "If I have 3 apples and buy 5 more, how many apples?",
+            "answer": "3 + 5 = 8\n#### 8",
+        },
+    ]
+
+    dataset = Dataset.from_list(rows)
+    tokenized_dataset = tokenize_sft_dataset(dataset, tokenizer, 1024)
+    #print(f'Tokenized dataset:\n{tokenized_dataset}')
+    collator = SFTDataCollator(tokenizer)
+    dataloader = DataLoader(tokenized_dataset, batch_size=2, shuffle=True, collate_fn=collator)
+    model = model.to('cuda')
+    optimizer = torch.optim.AdamW(model.parameters(), lr=2e-5, betas=(0.9, 0.95), weight_decay=0.01)
+
+    config = TrainConfig(
+        num_epochs=50,
+        grad_accum_steps=1,
+        log_every_steps=10,
+        checkpoint_every_steps=5,
+        output_dir="checkpoints",
+        use_wandb=True,
+    )
+    global_step = train(model, dataloader, optimizer, 'cuda', config)
+    print(f'Final global_step: {global_step}')
